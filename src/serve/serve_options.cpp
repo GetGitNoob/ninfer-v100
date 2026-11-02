@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "serve/request.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -80,6 +81,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
+"[--default-reasoning-effort E] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -109,7 +111,9 @@ std::string serve_usage_text(const char* argv0) {
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
-           "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --default-reasoning-effort sets the effort when a request omits it; "
+"request-level values take precedence\n"
+"       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -278,6 +282,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--default-reasoning-effort") {
+            const char* value = require_value("--default-reasoning-effort");
+            const auto effort = parse_requested_reasoning_effort(value);
+            if (!effort) {
+                throw std::invalid_argument(
+                    "--default-reasoning-effort must be none, minimal, low, "
+                    "medium, high, xhigh or max");
+            }
+            if (!options.enable_thinking &&
+                *effort != RequestedReasoningEffort::None) {
+                throw std::invalid_argument(
+                    "--default-reasoning-effort conflicts with --no-thinking");
+            }
+            options.default_reasoning_effort = *effort;
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
@@ -287,6 +305,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
+            if (options.default_reasoning_effort &&
+                *options.default_reasoning_effort != RequestedReasoningEffort::None) {
+                throw std::invalid_argument(
+                    "--no-thinking conflicts with --default-reasoning-effort");
+            }
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;

@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "product/logging/logging.h"
+#include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +53,8 @@ struct ServeOptions {
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
     std::optional<std::uint32_t> default_thinking_budget;
+    // Effort used when a request omits its own reasoning effort.
+    std::optional<RequestedReasoningEffort> default_reasoning_effort;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

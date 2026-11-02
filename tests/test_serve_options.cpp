@@ -23,6 +23,14 @@ ServeOptions parse(std::vector<std::string> arguments) {
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
 }
 
+template <typename Function>
+ApiError api_error(Function&& function) {
+    try {
+        function();
+    } catch (const ApiException& exception) { return exception.error(); }
+    return ApiError{.status = 0, .message = "no exception"};
+}
+
 } // namespace
 
 int main() {
@@ -59,6 +67,8 @@ int main() {
                       "model id override is unexpectedly configured by default");
     failures += check(!defaults.default_thinking_budget,
                       "thinking budget is unexpectedly limited by default");
+    failures += check(!defaults.default_reasoning_effort,
+                      "reasoning effort is unexpectedly configured by default");
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
@@ -97,6 +107,12 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "37"});
     failures += check(thinking_budget.default_thinking_budget == 37,
                       "--default-thinking-budget did not preserve its positive value");
+
+    const ServeOptions reasoning_low =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "low"});
+    failures += check(
+        reasoning_low.default_reasoning_effort == RequestedReasoningEffort::Low,
+        "--default-reasoning-effort low did not preserve its value");
     bool zero_thinking_budget_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
@@ -293,6 +309,171 @@ int main() {
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
+    // --- Server default reasoning effort (--default-reasoning-effort) resolution ---
+    // Capabilities that accept every effort and default to xhigh, mirroring the production
+    // qwen3.8 chat template: the server default can only lower the effective effort.
+    ninfer::PromptCapabilities effort_caps;
+    effort_caps.enable_thinking                 = true;
+    effort_caps.reasoning_effort.low            = true;
+    effort_caps.reasoning_effort.medium         = true;
+    effort_caps.reasoning_effort.xhigh          = true;
+    effort_caps.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
+
+    const ServeOptions server_low    =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "low"});
+    const ServeOptions server_medium =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "medium"});
+
+    auto new_request = [] {
+        GenerationRequest request;
+        request.max_tokens = 1;
+        return request;
+    };
+
+    // 1. No server default and no client value: the template default is preserved (xhigh).
+    {
+        const auto resolved = resolve_prompt_semantics(new_request(), defaults, effort_caps);
+        failures += check(
+            resolved.enable_thinking && !resolved.reasoning_effort &&
+                resolved.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
+            "no default and no client effort did not preserve the template default");
+    }
+    // 2. Server default low and no client value: resolves to low.
+    {
+        const auto resolved = resolve_prompt_semantics(new_request(), server_low, effort_caps);
+        failures += check(
+            resolved.enable_thinking && resolved.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                resolved.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
+            "server default low without a client effort did not resolve to low");
+    }
+    // 3. Server default low and client medium: the client medium wins.
+    {
+        auto request = new_request();
+        request.reasoning_effort = RequestedReasoningEffort::Medium;
+        const auto resolved = resolve_prompt_semantics(request, server_low, effort_caps);
+        failures += check(
+            resolved.enable_thinking &&
+                resolved.reasoning_effort == ninfer::ReasoningEffort::Medium,
+            "client medium did not take precedence over server default low");
+    }
+    // 4. Server default low and client xhigh: the client xhigh wins.
+    {
+        auto request = new_request();
+        request.reasoning_effort = RequestedReasoningEffort::XHigh;
+        const auto resolved = resolve_prompt_semantics(request, server_low, effort_caps);
+        failures += check(
+            resolved.enable_thinking &&
+                resolved.reasoning_effort == ninfer::ReasoningEffort::XHigh,
+            "client xhigh did not take precedence over server default low");
+    }
+    // 5. Server default low and client none: thinking is disabled.
+    {
+        auto request = new_request();
+        request.reasoning_effort = RequestedReasoningEffort::None;
+        const auto resolved = resolve_prompt_semantics(request, server_low, effort_caps);
+        failures += check(
+            !resolved.enable_thinking && !resolved.reasoning_effort &&
+                !resolved.effective_reasoning_effort,
+            "client none with server default low did not disable thinking");
+    }
+    // 6. Server default medium and client low: the client low wins.
+    {
+        auto request = new_request();
+        request.reasoning_effort = RequestedReasoningEffort::Low;
+        const auto resolved = resolve_prompt_semantics(request, server_medium, effort_caps);
+        failures += check(
+            resolved.enable_thinking &&
+                resolved.reasoning_effort == ninfer::ReasoningEffort::Low,
+            "client low did not take precedence over server default medium");
+    }
+    // 7. --no-thinking conflicts with an incompatible server default, in either order;
+    //    a server default of "none" stays compatible with --no-thinking.
+    {
+        bool low_before_no_thinking_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "low",
+                         "--no-thinking"});
+        } catch (const std::invalid_argument&) { low_before_no_thinking_rejected = true; }
+        failures += check(low_before_no_thinking_rejected,
+                          "--no-thinking after --default-reasoning-effort low was accepted");
+        bool no_thinking_before_low_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--no-thinking", "--default-reasoning-effort",
+                         "low"});
+        } catch (const std::invalid_argument&) { no_thinking_before_low_rejected = true; }
+        failures += check(no_thinking_before_low_rejected,
+                          "--default-reasoning-effort low after --no-thinking was accepted");
+        const ServeOptions no_thinking_none =
+            parse({"ninfer-serve", "model.ninfer", "--no-thinking", "--default-reasoning-effort",
+                   "none"});
+        failures += check(
+            !no_thinking_none.enable_thinking &&
+                no_thinking_none.default_reasoning_effort == RequestedReasoningEffort::None,
+            "--no-thinking did not accept a compatible --default-reasoning-effort none");
+    }
+    // 8a. Assistant prefill: the server default must not force an effort onto a prefill, and a
+    //     prefill that still has thinking enabled is rejected, exactly as before. A client
+    //     opt-out of thinking keeps the prefill non-thinking.
+    {
+        auto request = new_request();
+        request.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+        const ApiError prefill_thinking =
+            api_error([&] { (void)resolve_prompt_semantics(request, server_low, effort_caps); });
+        failures += check(prefill_thinking.code == "assistant_prefill_not_supported",
+                          "assistant prefill with server-default thinking was not rejected");
+        auto opt_out = new_request();
+        opt_out.continuation   = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+        opt_out.enable_thinking = false;
+        const auto opt_out_resolved = resolve_prompt_semantics(opt_out, server_low, effort_caps);
+        failures += check(
+            !opt_out_resolved.enable_thinking && !opt_out_resolved.effective_reasoning_effort,
+            "an explicit client no-thinking did not keep an assistant prefill non-thinking");
+    }
+    // 8b. A tools request (auto mode) coexists with the server default reasoning effort and the
+    //     resolved effort reaches the prompt alongside the tool definitions.
+    {
+        auto request = new_request();
+        request.messages.push_back(
+            ChatTurn{.role = ninfer::ChatRole::User,
+                     .content = {ContentPart{.kind = ContentKind::Text,
+                                                                     .text = "what is the weather"}}});
+        request.tool_choice.mode = ToolChoiceMode::Auto;
+        request.tools.push_back(
+            ToolDefinition{.name = "get_weather", .description = "look up the weather",
+                           .input_schema_json = "{\"type\":\"object\"}"});
+        const auto resolved = resolve_prompt_semantics(request, server_low, effort_caps);
+        const auto input    = to_prompt_input(
+            request, resolved,
+            [](const ContentPart&) -> ninfer::OwnedMedia {
+                throw std::logic_error("the tools test request carries no media");
+            });
+        failures += check(
+            resolved.enable_thinking && resolved.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                input.options.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                input.options.tool_jsons.size() == 1,
+            "server default low did not coexist with a tools request");
+    }
+    // Invalid CLI values for --default-reasoning-effort are rejected.
+    {
+        bool bad_value_rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "ultra"});
+        } catch (const std::invalid_argument&) { bad_value_rejected = true; }
+        failures += check(bad_value_rejected, "invalid --default-reasoning-effort value was accepted");
+        bool missing_value_rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort"}); }
+        catch (const std::invalid_argument&) { missing_value_rejected = true; }
+        failures += check(missing_value_rejected, "value-less --default-reasoning-effort was accepted");
+    }
+    // Every supported effort value parses and preserves its enum.
+    for (const char* value : {"none", "minimal", "low", "medium", "high", "xhigh", "max"}) {
+        const auto parsed = parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort",
+                                   value});
+        failures += check(
+            parsed.default_reasoning_effort.has_value(),
+            (std::string("supported --default-reasoning-effort value was rejected: ") + value)
+                .c_str());
+    }
+
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
@@ -307,6 +488,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
                           std::string::npos,
                       "serve help omits --default-thinking-budget");
+    failures += check(serve_usage_text("ninfer-serve").find("--default-reasoning-effort") !=
+                          std::string::npos,
+                      "serve help omits --default-reasoning-effort");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

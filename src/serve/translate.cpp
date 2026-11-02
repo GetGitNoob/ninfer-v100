@@ -130,9 +130,23 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         }
         return result;
     };
-    if (!request.reasoning_effort) { return complete(); }
+    std::optional<RequestedReasoningEffort> requested_effort =
+        request.reasoning_effort;
 
-    const RequestedReasoningEffort requested = *request.reasoning_effort;
+    // The server default fills in only when the request omits an effort.
+    // Explicit client choices and assistant-prefill semantics take precedence.
+    if (!requested_effort && server.default_reasoning_effort &&
+        result.enable_thinking &&
+        !(request.enable_thinking.value_or(false) &&
+          *server.default_reasoning_effort == RequestedReasoningEffort::None) &&
+        request.continuation !=
+            ninfer::PromptContinuationMode::ContinueFinalAssistant) {
+        requested_effort = server.default_reasoning_effort;
+    }
+
+    if (!requested_effort) { return complete(); }
+
+    const RequestedReasoningEffort requested = *requested_effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
     if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
         invalid_prompt_option("reasoning effort conflicts with enable_thinking", "reasoning_effort",
